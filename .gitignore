@@ -1,0 +1,9 @@
+zig-out/
+.zig-cache/
+main.zig
+buildcopy.zig
+benchmark.zig
+benchmark_release.zig
+BENCHMARKS.md
+BENCHMARK_SUMMARY.md
+.DS_Store

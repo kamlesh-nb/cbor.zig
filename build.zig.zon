@@ -1,0 +1,15 @@
+.{
+    .name = .cbor,
+    .version = "0.0.1",
+    .fingerprint = 0x1feaffc76430f2d8,
+    .minimum_zig_version = "0.14.1",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        // For example...
+        //"LICENSE",
+        //"README.md",
+    },
+}
