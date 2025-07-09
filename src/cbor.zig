@@ -40,8 +40,21 @@ pub const CBOR = struct {
         _ = try encoder.encode(value);
     }
 
+    pub fn encodeStreamWithEstimate(self: *CBOR, value: anytype, writer: std.io.AnyWriter, allocator: std.mem.Allocator) CborError!void {
+        const estimated_size = estimateSize(@TypeOf(value), value);
+        var encoder = Encoder.initStreamingWithEstimate(writer, self.config, allocator, estimated_size) catch return CborError.OutOfMemory;
+        defer encoder.deinit();
+        _ = try encoder.encode(value);
+    }
+
     pub fn decode(self: *CBOR, comptime T: type, data: []const u8, output: *T) CborError!void {
         var decoder = Decoder.init(data, self.config);
+        try decoder.decode(T, output);
+    }
+
+    pub fn decodeStreamWithEstimate(self: *CBOR, comptime T: type, reader: std.io.AnyReader, output: *T, allocator: std.mem.Allocator, estimated_size: ?usize) CborError!void {
+        var decoder = Decoder.initStreamingWithEstimate(reader, self.config, allocator, estimated_size) catch return CborError.OutOfMemory;
+        defer decoder.deinit();
         try decoder.decode(T, output);
     }
 

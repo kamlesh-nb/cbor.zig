@@ -49,13 +49,16 @@ pub const CborError = error{
     MalformedInput,
     UnexpectedEof,
     OutOfMemory,
+    MissingBreakMarker,
 };
 
 pub const Config = struct {
     max_string_length: u32 = 1 << 16, // 64KB
     max_collection_size: u64 = 1 << 20, // 1M
     max_depth: u8 = 32, // Max nesting
-    stream_buffer_size: usize = 4096, // Streaming buffer
+    stream_buffer_size: usize = 4096, // Default streaming buffer size
+    min_stream_buffer_size: usize = 1024, // Minimum streaming buffer size
+    max_stream_buffer_size: usize = 64 * 1024, // Maximum streaming buffer size (64KB)
 
     // Enhanced configuration options
     enable_indefinite_length: bool = true, // Support for indefinite-length items
@@ -65,6 +68,19 @@ pub const Config = struct {
     allow_duplicate_keys: bool = true, // Allow duplicate keys in maps
     use_simd: bool = true, // Enable SIMD operations when available
     allocator_capacity_hint: ?usize = null, // Hint for arena allocator initial capacity
+
+    /// Calculate optimal streaming buffer size based on estimated data size
+    pub fn getStreamBufferSize(self: Config, estimated_size: ?usize) usize {
+        const base_size = self.stream_buffer_size;
+
+        if (estimated_size) |est_size| {
+            // Use a buffer that's at least 1/4 of the estimated size, but respect limits
+            const calculated_size = @max(base_size, est_size / 4);
+            return @min(@max(calculated_size, self.min_stream_buffer_size), self.max_stream_buffer_size);
+        }
+
+        return base_size;
+    }
 };
 
 // Helper structures and functions
@@ -142,7 +158,17 @@ pub fn estimateSize(comptime T: type, value: anytype) usize {
             // Handle slice of bytes
             if (ptr.child == u8 and ptr.is_const) {
                 const len = value.len;
-                return (if (len < 24) 1 else if (len <= 0xFF) 2 else if (len <= 0xFFFF) 3 else 5) + len;
+                var header_size: usize = undefined;
+                if (len < 24) {
+                    header_size = 1;
+                } else if (len <= 0xFF) {
+                    header_size = 2;
+                } else if (len <= 0xFFFF) {
+                    header_size = 3;
+                } else {
+                    header_size = 5;
+                }
+                return header_size + len;
             }
             @compileError("Unsupported pointer type");
         },

@@ -17,23 +17,80 @@ pub const Decoder = struct {
     config: Config,
     depth: u8,
     stream_reader: ?std.io.AnyReader = null,
-    stream_buffer: [4096]u8 = undefined,
+    stream_buffer: []u8 = &[_]u8{}, // Dynamic buffer
+    fallback_buffer: [4096]u8 = undefined, // Fallback for backward compatibility
     stream_pos: usize = 0,
     stream_len: usize = 0,
     allocator: std.mem.Allocator = undefined, // For methods that need allocation
+    owns_stream_buffer: bool = false, // Track if we allocated the buffer
 
     pub fn init(data: []const u8, config: Config) Decoder {
         return .{ .data = data, .pos = 0, .config = config, .depth = 0 };
     }
 
     pub fn initStreaming(reader: std.io.AnyReader, config: Config) Decoder {
-        return .{ .data = &[_]u8{}, .pos = 0, .config = config, .depth = 0, .stream_reader = reader };
+        return Decoder{
+            .data = &[_]u8{},
+            .pos = 0,
+            .config = config,
+            .depth = 0,
+            .stream_reader = reader,
+            // Don't set stream_buffer here - it will be set in fillStreamBuffer
+        };
+    }
+
+    /// Initialize streaming decoder with estimated size for optimal buffer sizing
+    pub fn initStreamingWithEstimate(reader: std.io.AnyReader, config: Config, allocator: std.mem.Allocator, estimated_size: ?usize) !Decoder {
+        const buffer_size = config.getStreamBufferSize(estimated_size);
+
+        // If the buffer size fits in our fallback, use it to avoid allocation
+        if (buffer_size <= 4096) {
+            var decoder = Decoder{
+                .data = &[_]u8{},
+                .pos = 0,
+                .config = config,
+                .depth = 0,
+                .stream_reader = reader,
+                .allocator = allocator,
+            };
+            decoder.stream_buffer = decoder.fallback_buffer[0..buffer_size];
+            return decoder;
+        }
+
+        // For larger buffers, allocate dynamically
+        const stream_buffer = try allocator.alloc(u8, buffer_size);
+
+        return Decoder{
+            .data = &[_]u8{},
+            .pos = 0,
+            .config = config,
+            .depth = 0,
+            .stream_reader = reader,
+            .stream_buffer = stream_buffer,
+            .allocator = allocator,
+            .owns_stream_buffer = true,
+        };
+    }
+
+    /// Clean up allocated resources
+    pub fn deinit(self: *Decoder) void {
+        if (self.owns_stream_buffer and self.stream_buffer.len > 0) {
+            self.allocator.free(self.stream_buffer);
+            self.stream_buffer = &[_]u8{};
+            self.owns_stream_buffer = false;
+        }
     }
 
     inline fn fillStreamBuffer(self: *Decoder) CborError!void {
         if (self.stream_reader) |reader| {
+            // Initialize buffer if not already set
+            if (self.stream_buffer.len == 0) {
+                const buffer_size = @min(self.config.stream_buffer_size, 4096);
+                self.stream_buffer = self.fallback_buffer[0..buffer_size];
+            }
+
             if (self.stream_pos >= self.stream_len) {
-                self.stream_len = reader.read(&self.stream_buffer) catch return CborError.IoError;
+                self.stream_len = reader.read(self.stream_buffer) catch return CborError.IoError;
                 self.stream_pos = 0;
                 if (self.stream_len == 0) return CborError.BufferUnderflow;
             }
@@ -58,9 +115,28 @@ pub const Decoder = struct {
     inline fn readSlice(self: *Decoder, len: usize) CborError![]const u8 {
         if (self.stream_reader != null) {
             if (len > self.stream_buffer.len) return CborError.InvalidLength; // Too large for streaming
+
+            // Ensure we have enough data in the buffer
             while (self.stream_pos + len > self.stream_len) {
-                try self.fillStreamBuffer();
+                // Calculate how much data is left unread
+                const remaining = self.stream_len - self.stream_pos;
+
+                // If we have some unread data, move it to the beginning
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, self.stream_buffer[0..remaining], self.stream_buffer[self.stream_pos..self.stream_len]);
+                }
+
+                // Update positions
+                self.stream_len = remaining;
+                self.stream_pos = 0;
+
+                // Read more data to fill the rest of the buffer
+                const bytes_read = self.stream_reader.?.read(self.stream_buffer[self.stream_len..]) catch return CborError.IoError;
+                if (bytes_read == 0) return CborError.BufferUnderflow; // End of stream
+                self.stream_len += bytes_read;
             }
+
+            // Now we can safely return the slice
             const slice = self.stream_buffer[self.stream_pos .. self.stream_pos + len];
             self.stream_pos += len;
             return slice;
@@ -119,51 +195,6 @@ pub const Decoder = struct {
                 return {};
             },
             else => @compileError("Unsupported type"),
-        }
-    }
-
-    pub fn decodeValueDebug(self: *Decoder, comptime T: type) CborError!T {
-        if (self.depth >= self.config.max_depth) return CborError.DepthExceeded;
-        self.depth += 1;
-        defer self.depth -= 1;
-
-        comptime validateType(T);
-        const type_info = @typeInfo(T);
-
-        switch (type_info) {
-            .int => {
-                return try self.decodeIntDebug(T);
-            },
-            .float => {
-                return try self.decodeFloat(T);
-            },
-            .bool => {
-                return try self.decodeBool();
-            },
-            .optional => {
-                return try self.decodeOptional(T);
-            },
-            .array => {
-                return try self.decodeArray(T);
-            },
-            .@"struct" => {
-                // Check if this is an ArrayList
-                if (comptime isArrayList(T)) {
-                    return try self.decodeArrayList(T);
-                } else {
-                    return try self.decodeStruct(T);
-                }
-            },
-            .pointer => {
-                return try self.decodeText();
-            },
-            .void => {
-                try self.expectNull();
-                return {};
-            },
-            else => {
-                @compileError("Unsupported type");
-            },
         }
     }
 
@@ -269,23 +300,11 @@ pub const Decoder = struct {
     }
 
     inline fn decodeOptional(self: *Decoder, comptime T: type) CborError!T {
-        const initial = try self.readInitialByte();
+        const initial_byte = try self.peekByte();
+        const initial: InitialByte = @bitCast(initial_byte);
         if (initial.major_type == @intFromEnum(MajorType.float_simple) and initial.additional_info == 22) {
+            _ = try self.readByte(); // consume the null byte
             return null;
-        }
-        // Fix: Handle rewind properly for both buffered and streaming modes
-        if (self.stream_reader != null) {
-            // For streaming mode, we need to handle this differently
-            // Save the byte and handle it in decodeValue
-            if (self.stream_pos > 0) {
-                self.stream_pos -= 1;
-            } else {
-                // This is a limitation - we can't rewind in streaming mode
-                // when the buffer has been consumed. Consider using a lookahead buffer.
-                return CborError.BufferUnderflow;
-            }
-        } else {
-            self.pos -= 1; // Rewind for buffered mode
         }
         return try self.decodeValue(@typeInfo(T).optional.child);
     }
@@ -309,6 +328,53 @@ pub const Decoder = struct {
         }
 
         return text_slice;
+    }
+
+    // String decoding that works correctly with streaming by copying data
+    pub fn decodeTextStreaming(self: *Decoder, buffer: []u8) CborError![]const u8 {
+        const initial = try self.readInitialByte();
+        if (initial.major_type != @intFromEnum(MajorType.text_string)) return CborError.TypeMismatch;
+        const length = try self.readLength(initial.additional_info);
+        if (length > self.config.max_string_length) return CborError.InvalidLength;
+        if (length > buffer.len) return CborError.InvalidLength;
+
+        // Read data directly into the provided buffer
+        if (self.stream_reader != null) {
+            var bytes_read: usize = 0;
+            while (bytes_read < length) {
+                const remaining = @as(usize, @intCast(length)) - bytes_read;
+                const chunk_size = @min(remaining, self.stream_len - self.stream_pos);
+
+                if (chunk_size > 0) {
+                    @memcpy(buffer[bytes_read .. bytes_read + chunk_size], self.stream_buffer[self.stream_pos .. self.stream_pos + chunk_size]);
+                    self.stream_pos += chunk_size;
+                    bytes_read += chunk_size;
+                }
+
+                if (bytes_read < length) {
+                    try self.fillStreamBuffer();
+                }
+            }
+
+            const result = buffer[0..@intCast(length)];
+
+            // Validate UTF-8 if configured
+            if (self.config.validate_utf8) {
+                const is_valid = if (self.config.use_simd)
+                    simd.Simd.validateUtf8(result)
+                else
+                    std.unicode.utf8ValidateSlice(result);
+
+                if (!is_valid) return CborError.InvalidUtf8;
+            }
+
+            return result;
+        } else {
+            // Non-streaming mode
+            const text_slice = try self.readSlice(@intCast(length));
+            @memcpy(buffer[0..text_slice.len], text_slice);
+            return buffer[0..text_slice.len];
+        }
     }
 
     // Zero-copy string decoding for non-streaming mode
@@ -376,11 +442,25 @@ pub const Decoder = struct {
         if (initial.major_type != @intFromEnum(MajorType.array)) return CborError.TypeMismatch;
         const length = try self.readLength(initial.additional_info);
         const arr_info = @typeInfo(T).array;
-        if (length != arr_info.len) return CborError.InvalidLength;
+
+        if (initial.additional_info != INDEFINITE_LENGTH) {
+            if (length != arr_info.len) return CborError.InvalidLength;
+        }
 
         var result: T = undefined;
-        inline for (&result) |*item| {
-            item.* = try self.decodeValue(arr_info.child);
+        if (initial.additional_info == INDEFINITE_LENGTH) {
+            var i: usize = 0;
+            while (i < arr_info.len) : (i += 1) {
+                if (try self.peekByte() == BREAK_MARKER) return CborError.InvalidLength;
+                result[i] = try self.decodeValue(arr_info.child);
+            }
+            if (try self.readByte() != BREAK_MARKER) return CborError.MissingBreakMarker;
+        } else {
+            // Use regular for loop to avoid stack overflow with large arrays
+            for (&result, 0..) |*item, i| {
+                _ = i; // suppress unused variable warning
+                item.* = try self.decodeValue(arr_info.child);
+            }
         }
         return result;
     }
@@ -388,24 +468,51 @@ pub const Decoder = struct {
     inline fn decodeStruct(self: *Decoder, comptime T: type) CborError!T {
         const initial = try self.readInitialByte();
         if (initial.major_type != @intFromEnum(MajorType.map)) return CborError.TypeMismatch;
-        const length = try self.readLength(initial.additional_info);
+        const length = if (initial.additional_info == INDEFINITE_LENGTH) INDEFINITE_LENGTH else try self.readLength(initial.additional_info);
         const fields = @typeInfo(T).@"struct".fields;
-        if (length > self.config.max_collection_size) return CborError.InvalidLength;
+        if (length != INDEFINITE_LENGTH and length > self.config.max_collection_size) return CborError.InvalidLength;
 
         var result: T = undefined;
         var fields_set = [_]bool{false} ** fields.len;
 
-        var i: u64 = 0;
-        while (i < length) : (i += 1) {
-            const key = try self.decodeText();
-            inline for (fields, 0..) |field, idx| {
-                if (std.mem.eql(u8, key, field.name)) {
-                    @field(result, field.name) = try self.decodeValue(field.type);
-                    fields_set[idx] = true;
-                    break;
+        // For streaming mode, we need to handle string keys carefully since the buffer can be overwritten
+        var key_buffer: [256]u8 = undefined; // Buffer for copying keys in streaming mode
+
+        if (length == INDEFINITE_LENGTH) {
+            while (try self.peekByte() != BREAK_MARKER) {
+                const key = if (self.stream_reader != null)
+                    try self.decodeTextStreaming(&key_buffer)
+                else
+                    try self.decodeText();
+
+                inline for (fields, 0..) |field, idx| {
+                    if (std.mem.eql(u8, key, field.name)) {
+                        @field(result, field.name) = try self.decodeValue(field.type);
+                        fields_set[idx] = true;
+                        break;
+                    }
+                } else {
+                    try self.skipValue();
                 }
-            } else {
-                try self.skipValue();
+            }
+            _ = try self.readByte(); // consume break marker
+        } else {
+            var i: u64 = 0;
+            while (i < length) : (i += 1) {
+                const key = if (self.stream_reader != null)
+                    try self.decodeTextStreaming(&key_buffer)
+                else
+                    try self.decodeText();
+
+                inline for (fields, 0..) |field, idx| {
+                    if (std.mem.eql(u8, key, field.name)) {
+                        @field(result, field.name) = try self.decodeValue(field.type);
+                        fields_set[idx] = true;
+                        break;
+                    }
+                } else {
+                    try self.skipValue();
+                }
             }
         }
 
@@ -541,7 +648,7 @@ pub const Decoder = struct {
 
             // If this key matches what we're looking for, read the value and return it
             if (std.mem.eql(u8, key, field_name)) {
-                return try self.decodeValueDebug(T);
+                return try self.decodeValue(T);
             } else {
                 // Skip the value if it's not what we're looking for
                 try self.skipValue();
@@ -564,5 +671,32 @@ pub const Decoder = struct {
             return CborError.BufferUnderflow;
         }
         return self.data[self.pos];
+    }
+
+    // Helper to decode text that copies data in streaming mode
+    pub fn decodeTextCopy(self: *Decoder, allocator: std.mem.Allocator) CborError![]const u8 {
+        const initial = try self.readInitialByte();
+        if (initial.major_type != @intFromEnum(MajorType.text_string)) return CborError.TypeMismatch;
+        const length = try self.readLength(initial.additional_info);
+        if (length > self.config.max_string_length) return CborError.InvalidLength;
+
+        const text_slice = try self.readSlice(@intCast(length));
+
+        // Validate UTF-8 if configured
+        if (self.config.validate_utf8) {
+            const is_valid = if (self.config.use_simd)
+                simd.Simd.validateUtf8(text_slice)
+            else
+                std.unicode.utf8ValidateSlice(text_slice);
+
+            if (!is_valid) return CborError.InvalidUtf8;
+        }
+
+        // For streaming mode, copy the data to avoid buffer overwrite issues
+        if (self.stream_reader != null) {
+            return allocator.dupe(u8, text_slice) catch return CborError.OutOfMemory;
+        }
+
+        return text_slice;
     }
 };

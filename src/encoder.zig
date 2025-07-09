@@ -19,15 +19,67 @@ pub const Encoder = struct {
     config: Config,
     depth: u8,
     stream_writer: ?std.io.AnyWriter = null,
-    stream_buffer: [4096]u8 = undefined,
+    stream_buffer: []u8 = &[_]u8{}, // Dynamic buffer
+    fallback_buffer: [4096]u8 = undefined, // Fallback for backward compatibility
     stream_pos: usize = 0,
+    allocator: std.mem.Allocator = undefined, // For cleanup
+    owns_stream_buffer: bool = false, // Track if we allocated the buffer
 
     pub fn init(buffer: []u8, config: Config) Encoder {
         return .{ .buffer = buffer, .pos = 0, .config = config, .depth = 0 };
     }
 
     pub fn initStreaming(writer: std.io.AnyWriter, config: Config) Encoder {
-        return .{ .buffer = &[_]u8{}, .pos = 0, .config = config, .depth = 0, .stream_writer = writer };
+        return Encoder{
+            .buffer = &[_]u8{},
+            .pos = 0,
+            .config = config,
+            .depth = 0,
+            .stream_writer = writer,
+            // Don't set stream_buffer here - it will be set when needed
+        };
+    }
+
+    /// Initialize streaming encoder with estimated size for optimal buffer sizing
+    pub fn initStreamingWithEstimate(writer: std.io.AnyWriter, config: Config, allocator: std.mem.Allocator, estimated_size: ?usize) !Encoder {
+        const buffer_size = config.getStreamBufferSize(estimated_size);
+
+        // If the buffer size fits in our fallback, use it to avoid allocation
+        if (buffer_size <= 4096) {
+            var encoder = Encoder{
+                .buffer = &[_]u8{},
+                .pos = 0,
+                .config = config,
+                .depth = 0,
+                .stream_writer = writer,
+                .allocator = allocator,
+            };
+            encoder.stream_buffer = encoder.fallback_buffer[0..buffer_size];
+            return encoder;
+        }
+
+        // For larger buffers, allocate dynamically
+        const stream_buffer = try allocator.alloc(u8, buffer_size);
+
+        return Encoder{
+            .buffer = &[_]u8{},
+            .pos = 0,
+            .config = config,
+            .depth = 0,
+            .stream_writer = writer,
+            .stream_buffer = stream_buffer,
+            .allocator = allocator,
+            .owns_stream_buffer = true,
+        };
+    }
+
+    /// Clean up allocated resources
+    pub fn deinit(self: *Encoder) void {
+        if (self.owns_stream_buffer and self.stream_buffer.len > 0) {
+            self.allocator.free(self.stream_buffer);
+            self.stream_buffer = &[_]u8{};
+            self.owns_stream_buffer = false;
+        }
     }
 
     inline fn flushStream(self: *Encoder) CborError!void {
@@ -41,6 +93,12 @@ pub const Encoder = struct {
 
     inline fn writeByte(self: *Encoder, byte: u8) CborError!void {
         if (self.stream_writer != null) {
+            // Initialize buffer if not already set
+            if (self.stream_buffer.len == 0) {
+                const buffer_size = @min(self.config.stream_buffer_size, 4096);
+                self.stream_buffer = self.fallback_buffer[0..buffer_size];
+            }
+
             if (self.stream_pos >= self.stream_buffer.len) try self.flushStream();
             self.stream_buffer[self.stream_pos] = byte;
             self.stream_pos += 1;
@@ -52,21 +110,47 @@ pub const Encoder = struct {
     }
 
     inline fn writeSlice(self: *Encoder, data: []const u8) CborError!void {
-        if (data.len >= 32 and self.stream_writer == null) {
-            // Check bounds before operation
+        if (self.stream_writer) |writer| {
+            // Initialize buffer if not already set
+            if (self.stream_buffer.len == 0) {
+                const buffer_size = @min(self.config.stream_buffer_size, 4096);
+                self.stream_buffer = self.fallback_buffer[0..buffer_size];
+            }
+
+            // Streaming mode
+            var data_to_write = data;
+            while (data_to_write.len > 0) {
+                const space_in_buffer = self.stream_buffer.len - self.stream_pos;
+                if (data_to_write.len > space_in_buffer) {
+                    if (space_in_buffer > 0) {
+                        @memcpy(self.stream_buffer[self.stream_pos..], data_to_write[0..space_in_buffer]);
+                        self.stream_pos += space_in_buffer;
+                    }
+                    try self.flushStream();
+
+                    // If remaining data is larger than buffer, write it directly
+                    if (data_to_write.len > self.stream_buffer.len) {
+                        writer.writeAll(data_to_write[space_in_buffer..]) catch return CborError.IoError;
+                        data_to_write = &[_]u8{}; // Empty slice
+                    } else {
+                        data_to_write = data_to_write[space_in_buffer..];
+                    }
+                } else {
+                    @memcpy(self.stream_buffer[self.stream_pos..][0..data_to_write.len], data_to_write);
+                    self.stream_pos += data_to_write.len;
+                    break;
+                }
+            }
+        } else {
+            // Buffered mode
             if (self.pos + data.len > self.buffer.len) return CborError.BufferOverflow;
 
-            // Use SIMD-optimized copy if configuration allows and data is large enough
             if (self.config.use_simd and data.len >= 64) {
                 simd.Simd.copyBytes(self.buffer[self.pos..][0..data.len], data);
             } else {
                 @memcpy(self.buffer[self.pos..][0..data.len], data);
             }
             self.pos += data.len;
-        } else {
-            for (data) |byte| {
-                try self.writeByte(byte);
-            }
         }
     }
 
@@ -81,8 +165,10 @@ pub const Encoder = struct {
     }
 
     fn encodeLength(self: *Encoder, major_type: MajorType, length: u64) CborError!void {
-        // Check against configured maximum size
-        if (length > self.config.max_collection_size) return CborError.InvalidLength;
+        // Check against configured maximum size for collections (not strings)
+        if (major_type == .array or major_type == .map) {
+            if (length > self.config.max_collection_size) return CborError.InvalidLength;
+        }
 
         // Calculate which length encoding to use based on the size
         if (length < 24) {

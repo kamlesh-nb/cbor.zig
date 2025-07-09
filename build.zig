@@ -4,8 +4,6 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
- 
-
     // Create the main CBOR library module
     const cbor_mod = b.addModule("cbor", .{
         .root_source_file = b.path("src/root.zig"),
@@ -20,7 +18,6 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(lib);
 
-    
     const exe = b.addExecutable(.{
         .name = "cbor",
         .root_source_file = b.path("src/main.zig"),
@@ -40,7 +37,6 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the demo app");
     run_step.dependOn(&run_cmd.step);
-
 
     const lib_unit_tests = b.addTest(.{
         .name = "cbor-lib-tests",
@@ -75,7 +71,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_exe_unit_tests.step);
     test_step.dependOn(&run_cbor_tests.step);
 
-    const cbor_test_step = b.step("test-cbor", "Run comprehensive CBOR tests");
+    const cbor_test_step = b.step("test-cbor", "Run comprehensive CBOR tests (includes streaming tests)");
     cbor_test_step.dependOn(&run_cbor_tests.step);
 
     // =============================================================================
