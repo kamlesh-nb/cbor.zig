@@ -1,0 +1,19 @@
+.{
+    .name = .zbor_benchmark,
+    .version = "0.1.0",
+    .fingerprint = 0x62dee6d2e187a536,
+    .minimum_zig_version = "0.13.0",
+
+    .dependencies = .{
+        // The ZBOR benchmark project depends on the main CBOR library
+        // which is located in the parent directory structure
+    },
+
+    .paths = .{
+        "bench.zig",
+        "build.zig",
+        "build.zig.zon",
+        // Include access to the parent src directory for the CBOR library
+        "../../src/",
+    },
+}
