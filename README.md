@@ -17,7 +17,7 @@ Add the package to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .cbor = .{
-        .url = "https://github.com/yourusername/cbor.zig/archive/refs/tags/v1.0.0.tar.gz",
+        .url = "https://github.com/kamlesh-nb/cbor.zig/archive/refs/tags/v0.0.1.tar.gz",
         // Add the appropriate hash for your release
     },
 },
