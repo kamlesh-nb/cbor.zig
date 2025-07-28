@@ -528,38 +528,6 @@ pub const Decoder = struct {
         return result;
     }
 
-    inline fn decodeArrayList(self: *Decoder, comptime T: type) CborError!T {
-        const initial = try self.readInitialByte();
-        if (initial.major_type != @intFromEnum(MajorType.array)) return CborError.TypeMismatch;
-        const length = try self.readLength(initial.additional_info);
-        if (length > self.config.max_collection_size) return CborError.InvalidLength;
-
-        // Create an ArrayList with default allocator - user should provide allocator
-        // This is a basic implementation that requires the ArrayList to be initialized
-        var result: T = undefined;
-
-        // Assuming the ArrayList has been properly initialized with an allocator
-        // We'll try to resize it to accommodate the items
-        if (@hasDecl(T, "resize")) {
-            try result.resize(@intCast(length));
-        } else if (@hasDecl(T, "ensureTotalCapacity")) {
-            try result.ensureTotalCapacity(@intCast(length));
-        }
-
-        var i: u64 = 0;
-        while (i < length) : (i += 1) {
-            const item_type = @TypeOf(result.items[0]);
-            const item = try self.decodeValue(item_type);
-            if (@hasDecl(T, "append")) {
-                try result.append(item);
-            } else {
-                result.items[i] = item;
-            }
-        }
-
-        return result;
-    }
-
     pub fn isIndefiniteLength(_: *Decoder, byte: InitialByte) bool {
         return byte.additional_info == INDEFINITE_LENGTH;
     }

@@ -408,25 +408,17 @@ pub const Encoder = struct {
         self.depth -= 1;
     }
 
-    // ArrayList encoding
-    fn encodeArrayList(self: *Encoder, list: anytype) CborError!void {
-        try self.encodeLength(.array, list.items.len);
-        for (list.items) |item| {
-            try self.encodeValue(item);
-        }
-    }
-
     // Local enum encoding function
     pub fn encodeEnum(self: *Encoder, value: anytype) CborError!void {
         const T = @TypeOf(value);
         const type_info = @typeInfo(T);
 
-        if (type_info != .Enum) {
+        if (type_info != .@"enum") {
             @compileError("Expected enum type");
         }
 
         // Simple encoding: use the integer value
-        const tag_type = type_info.Enum.tag_type;
+        const tag_type = type_info.@"enum".tag_type;
         const int_value = @intFromEnum(value);
 
         try self.encodeInt(@as(tag_type, int_value));

@@ -1896,3 +1896,34 @@ test "streaming string limitations demonstration" {
     // The limitation occurs when multiple reads happen, corrupting earlier slices
     // This is why struct parsing with multiple string fields can fail in streaming mode
 }
+
+test "decode person with arraylist of addresses" {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit    ();
+    const allocator = gpa.allocator();
+
+    var buffer: [3000]u8 = undefined;
+    const config = cbor.Config{};
+    var cbor_instance = cbor.CBOR.init(config);
+
+    // Create test person with addresses
+    var person = try createTestPerson(allocator);
+    defer person.addresses.deinit();
+
+    // Encode Person struct containing ArrayList of Address structs
+    const encoded = try cbor_instance.encode(person, &buffer);
+
+    // Verify encoding produces a valid CBOR map
+    var decoder = cbor.Decoder.init(encoded, config);
+    const initial = try decoder.readInitialByte();
+    try std.testing.expectEqual(@as(u3, 5), initial.major_type); // Map major type
+    try std.testing.expectEqual(@as(u5, 5), initial.additional_info); // 5 fields
+
+    // Decode the person struct back
+    var decoded_person: Person = undefined;
+    try decoder.decode(Person, &decoded_person);
+
+    // Verify the decoded data matches the original
+    try testing.expectEqualStrings(person.name, decoded_person.name);
+    try testing.expectEqual(person.age, decoded_person.age);
+}
