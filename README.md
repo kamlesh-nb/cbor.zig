@@ -1,14 +1,10 @@
 # CBOR.zig
 
-A CBOR (Concise Binary Object Representation) implementation for Zig, compliant with RFC 8949.
+A CBOR (Concise Binary Object Representation) implementation for Zig, mostly compliant with RFC 8949.
 
 ## Features
 
-- Zero-allocation encoding and decoding with fixed buffers.
 - Supports integers, strings, arrays, maps, floats, and structs.
-- Provides error handling and diagnostic messages.
-- Suitable for embedded systems and other performance-sensitive applications.
-- Includes SIMD-accelerated operations for UTF-8 validation and memory copying.
 
 ## Installation
 
@@ -17,8 +13,7 @@ Add the package to your `build.zig.zon`:
 ```zig
 .dependencies = .{
     .cbor = .{
-        .url = "https://github.com/kamlesh-nb/cbor.zig/archive/refs/tags/v0.0.1.tar.gz",
-        // Add the appropriate hash for your release
+        .url = "https://github.com/kamlesh-nb/cbor.zig/archive/refs/tags/<version>.tar.gz",
     },
 },
 ```
@@ -26,83 +21,71 @@ Add the package to your `build.zig.zon`:
 Then, add the module to your `build.zig`:
 
 ```zig
-const cbor_dep = b.dependency("cbor", .{
-    .target = target,
-    .optimize = optimize,
-});
-exe.addModule("cbor", cbor_dep.module("cbor"));
+    const cbor = b.dependency("cbor", .{});
+
+    const exe = b.addExecutable(.{
+        .name = "<name>",
+        .root_module = exe_mod,
+    });
+
+    exe.root_module.addImport("cbor", cbor.module("cbor"));
 ```
 
 ## Basic Usage
 
 ```zig
 const std = @import("std");
-const cbor = @import("cbor");
+const Serde = @import("cbor.zig").Serde;
 
 pub fn main() !void {
-    // Encoding example
-    var buffer: [128]u8 = undefined;
-    var encoder = cbor.Encoder.init(&buffer, .{});
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-    const value = 42;
-    const len = try encoder.encode(value);
-    const encoded_data = buffer[0..len];
+    const Address = struct {
+        street: []const u8,
+        city: []const u8,
+    };
+    const Person = struct {
+        name: []const u8,
+        age: u32,
+        addresses: []Address,
+    };
 
-    std.debug.print("Encoded: {any}\n", .{encoded_data});
+    var serde = Serde.init(allocator, .{});
+    defer serde.deinit();
 
-    // Decoding example
-    var decoder = cbor.Decoder.init(encoded_data, .{});
+    const orig_person = Person{
+        .name = "Lala Amarnath",
+        .age = 130,
+        .addresses = try allocator.dupe(Address, &[_]Address{
+            Address{ .street = "I don't know", .city = "Amritsar" },
+            Address{ .street = "Again I don't know", .city = "New Delhi" },
+        }),
+    };
 
-    var decoded_value: u8 = undefined;
-    try decoder.decode(u8, &decoded_value);
+    defer allocator.free(orig_person.addresses);
 
-    std.debug.print("Decoded: {}\n", .{decoded_value});
+    const serialized = try serde.serialize(orig_person);
+    defer allocator.free(serialized);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    std.debug.print("\n==================Original Person==================\n", .{});
+    std.debug.print("Name: {s}\n", .{orig_person.name});
+    std.debug.print("Age: {d}\n", .{orig_person.age});
+    for (orig_person.addresses) |address| {
+        std.debug.print("Address: {s}, {s}\n", .{ address.street, address.city });
+    }
+
+    const deserialized_person = try serde.deserialize(serialized, Person);
+    std.debug.print("\n==================Deserialized Person==================\n", .{});
+    std.debug.print("Name: {s}\n", .{deserialized_person.name});
+    std.debug.print("Age: {d}\n", .{deserialized_person.age});
+    for (deserialized_person.addresses) |address| {
+        std.debug.print("Address: {s}, {s}\n", .{ address.street, address.city });
+    }
 }
+
 ```
-
-## Performance
-
-Here is a performance comparison of `cbor.zig` against popular Go and Rust CBOR libraries. Benchmarks were run on an Apple M1 Pro. Lower is better.
-
-| Benchmark                    | Zig (ns/op) | Go (ns/op) | Rust (ns/op) |
-| ---------------------------- | ----------- | ---------- | ------------ |
-| **Encode Integer** (65536)   | 6           | 60.26      | 29           |
-| **Decode Integer** (65536)   | 6           | 45.68      | 6            |
-| **Encode String** (69 chars) | 13          | 70.81      | 100          |
-| **Decode String** (69 chars) | 2           | 72.76      | 43           |
-| **Encode Array** (100 ints)  | 401         | 1301       | 708          |
-| **Decode Array** (100 ints)  | 508         | 1686       | 340          |
-| **Encode Struct** (simple)   | 69          | 155.4      | 230          |
-| **Decode Struct** (simple)   | 53          | 193.0      | 86           |
-
-_Note: These are simplified results. For detailed benchmark output, see the `bench` directory._
-
-To run the benchmarks, navigate to the `bench/{zig,go,rust}` directories and follow the instructions in their respective README files (or build files).
-
-## API
-
-### `cbor.Encoder`
-
-- `init(buffer: []u8, config: Config) -> Encoder`
-- `encode(value: anytype) -> !usize`
-- `encodeValue(value: anytype) -> !void`
-- `encodeIndefiniteArray() -> !void`
-- `encodeIndefiniteMap() -> !void`
-- `encodeBreak() -> !void`
-
-### `cbor.Decoder`
-
-- `init(data: []const u8, config: Config) -> Decoder`
-- `decode(comptime T: type, output: *T) -> !void`
-- `decodeValue(comptime T: type) -> !T`
-- `skipValue() -> !void`
-
-### `cbor.Config`
-
-A struct to configure encoding and decoding behavior, such as:
-
-- `max_string_length`
-- `max_collection_size`
-- `max_depth`
-- `validate_utf8`
-- `use_simd`

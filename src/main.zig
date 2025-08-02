@@ -1,3 +1,53 @@
 const std = @import("std");
+const Serde = @import("cbor.zig").Serde;
 
-fn main() !void {}
+pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    const Address = struct {
+        street: []const u8,
+        city: []const u8,
+    };
+    const Person = struct {
+        name: []const u8,
+        age: u32,
+        addresses: []Address,
+    };
+
+    var serde = Serde.init(allocator, .{});
+    defer serde.deinit();
+
+    const orig_person = Person{
+        .name = "Lala Amarnath",
+        .age = 130,
+        .addresses = try allocator.dupe(Address, &[_]Address{
+            Address{ .street = "I don't know", .city = "Amritsar" },
+            Address{ .street = "Again I don't know", .city = "New Delhi" },
+        }),
+    };
+
+    defer allocator.free(orig_person.addresses);
+
+    const serialized = try serde.serialize(orig_person);
+    defer allocator.free(serialized);
+
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+
+    std.debug.print("\n==================Original Person==================\n", .{});
+    std.debug.print("Name: {s}\n", .{orig_person.name});
+    std.debug.print("Age: {d}\n", .{orig_person.age});
+    for (orig_person.addresses) |address| {
+        std.debug.print("Address: {s}, {s}\n", .{ address.street, address.city });
+    }
+
+    const deserialized_person = try serde.deserialize(serialized, Person);
+    std.debug.print("\n==================Deserialized Person==================\n", .{});
+    std.debug.print("Name: {s}\n", .{deserialized_person.name});
+    std.debug.print("Age: {d}\n", .{deserialized_person.age});
+    for (deserialized_person.addresses) |address| {
+        std.debug.print("Address: {s}, {s}\n", .{ address.street, address.city });
+    }
+}
